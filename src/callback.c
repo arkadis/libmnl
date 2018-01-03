@@ -10,20 +10,75 @@
 #include <errno.h>
 #include <libmnl/libmnl.h>
 #include "internal.h"
+#include <string.h>
 
 static int mnl_cb_noop(const struct nlmsghdr *nlh, void *data)
 {
 	return MNL_CB_OK;
 }
 
+static int err_attr_cb(const struct nlattr *attr, void *data)
+{
+	const struct nlattr **tb = data;
+	uint16_t type;
+
+	if (mnl_attr_type_valid(attr, NLMSGERR_ATTR_MAX) < 0) {
+		fprintf(stderr, "Invalid extack attribute\n");
+		return MNL_CB_ERROR;
+	}
+
+	type = mnl_attr_get_type(attr);
+/*
+	if (mnl_attr_validate(attr, extack_policy[type]) < 0) {
+		fprintf(stderr, "extack attribute %d failed validation\n",
+			type);
+		return MNL_CB_ERROR;
+	}
+*/
+	tb[type] = attr;
+	return MNL_CB_OK;
+}
+
+static int mnl_dump_ext_err(const struct nlmsghdr *nlh)
+{
+	struct nlattr *tb[NLMSGERR_ATTR_MAX + 1] = {};
+	const struct nlmsgerr *err = mnl_nlmsg_get_payload(nlh);
+	unsigned int hlen = sizeof(*err);
+	const char *errmsg = NULL;
+
+	if (nlh->nlmsg_len < mnl_nlmsg_size(sizeof(struct nlmsgerr))) {
+		errno = EBADMSG;
+		return MNL_CB_ERROR;
+	}
+
+	/* if NLM_F_CAPPED is set then the inner err msg was capped */
+	if (!(nlh->nlmsg_flags & NLM_F_CAPPED))
+		hlen += mnl_nlmsg_get_payload_len(&err->msg);
+
+	if (mnl_attr_parse(nlh, hlen, err_attr_cb, tb) != MNL_CB_OK)
+		return 0;
+
+	if (tb[NLMSGERR_ATTR_MSG])
+		errmsg = mnl_attr_get_str(tb[NLMSGERR_ATTR_MSG]);
+
+	if (errmsg && *errmsg != '\0') {
+		fprintf(stdout, "Error: %s", errmsg);
+		if (errmsg[strlen(errmsg) - 1] != '.')
+			fprintf(stdout, ".");
+		fprintf(stdout, "\n");
+
+		return 1;
+	}
+	return 0;
+}
+
 static int mnl_cb_error(const struct nlmsghdr *nlh, void *data)
 {
 	const struct nlmsgerr *err = mnl_nlmsg_get_payload(nlh);
 
-	if (nlh->nlmsg_len < mnl_nlmsg_size(sizeof(struct nlmsgerr))) {
-		errno = EBADMSG; 
-		return MNL_CB_ERROR;
-	}
+	if (mnl_dump_ext_err(nlh))
+		return MNL_CB_STOP;
+
 	/* Netlink subsystems returns the errno value with different signess */
 	if (err->error < 0)
 		errno = -err->error;
